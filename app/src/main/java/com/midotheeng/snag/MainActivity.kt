@@ -39,7 +39,11 @@ private fun Home() {
     val ok = Net.firstUrl(link) != null || XApi.extractId(link) != null
 
     Column(Modifier.fillMaxSize().background(Color.White).systemBarsPadding().padding(22.dp)) {
-        Text("Snag", fontSize = 34.sp, fontWeight = FontWeight.Black, color = Ink)
+        Row(verticalAlignment = androidx.compose.ui.Alignment.Bottom) {
+            Text("Snag", fontSize = 34.sp, fontWeight = FontWeight.Black, color = Ink)
+            Spacer(Modifier.width(8.dp))
+            Text("v" + ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName, color = Color(0xFF8B98A5), fontSize = 13.sp, modifier = Modifier.padding(bottom = 7.dp))
+        }
         Text("Full-resolution media from X, Pinterest, Facebook and Google", color = Color(0xFF536471), fontSize = 15.sp)
         Spacer(Modifier.height(24.dp))
 

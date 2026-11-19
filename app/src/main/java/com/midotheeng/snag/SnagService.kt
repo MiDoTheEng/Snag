@@ -72,7 +72,7 @@ class SnagService : Service() {
             try { makeGif(post, g); made++ } catch (e: Exception) {
                 // Never come away empty-handed: keep the original looping MP4.
                 Saver.enqueue(this, post, listOf(g))
-                toast("Couldn't convert the GIF (${e.message}) — saved it as a video")
+                toastLong("GIF failed: ${e.message}. Saved it as a video instead.")
             }
         }
         if (made > 0) toast(if (made == 1) "GIF saved" else "$made GIFs saved")
@@ -82,15 +82,17 @@ class SnagService : Service() {
     private fun makeGif(post: Post, m: Media) {
         val tmp = File.createTempFile("snag", ".mp4", cacheDir)
         try {
-            download(m.url, m.headers, tmp)
-            if (tmp.length() < 1000) throw Exception("The GIF didn't download.")
+            val type = download(m.url, m.headers, tmp)
+            val head = tmp.inputStream().use { i -> ByteArray(12).also { i.read(it) } }
+            val isMp4 = String(head, 4, 4, Charsets.ISO_8859_1) == "ftyp"
+            if (!isMp4) throw Exception("got ${tmp.length()} bytes of '$type', not a video")
             // Up to 480px on the long side (WhatsApp-friendly), ~14 fps, max 15 s.
             var gif: GifMaker? = null
             FrameReader.read(tmp.absolutePath, 480, 70_000L, 15_000_000L) { px, w, h ->
                 val g = gif ?: GifMaker(w, h, 7).also { gif = it }
                 g.addFrame(px)
             }
-            val g = gif?.takeIf { it.frameCount() > 0 } ?: throw Exception("Couldn't read that GIF.")
+            val g = gif?.takeIf { it.frameCount() > 0 } ?: throw Exception("${tmp.length() / 1024} KB mp4 — ${FrameReader.lastError}")
 
             val name = Saver.fileName(post, m, "gif")
             val values = ContentValues().apply {
@@ -107,7 +109,7 @@ class SnagService : Service() {
         } finally { tmp.delete() }
     }
 
-    private fun download(url: String, headers: Map<String, String>, to: File) {
+    private fun download(url: String, headers: Map<String, String>, to: File): String {
         val c = URL(url).openConnection() as HttpURLConnection
         c.connectTimeout = 15000; c.readTimeout = 30000
         c.setRequestProperty("User-Agent", MOBILE_UA)
@@ -115,6 +117,7 @@ class SnagService : Service() {
         try {
             if (c.responseCode !in 200..299) throw Exception("Download failed (${c.responseCode})")
             c.inputStream.use { i -> to.outputStream().use { o -> i.copyTo(o) } }
+            return c.contentType.orEmpty()
         } finally { c.disconnect() }
     }
 
@@ -135,6 +138,7 @@ class SnagService : Service() {
     }
 
     // ------------------------------------------------ helpers
+    private fun toastLong(msg: String) = main.post { Toast.makeText(applicationContext, "Snag: $msg", Toast.LENGTH_LONG).show() }
     private fun toast(msg: String) = main.post { Toast.makeText(applicationContext, "Snag: $msg", Toast.LENGTH_SHORT).show() }
 
     private fun goForeground(text: String) {

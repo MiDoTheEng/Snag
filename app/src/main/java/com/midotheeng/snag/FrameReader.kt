@@ -16,15 +16,22 @@ import android.media.MediaMetadataRetriever
 object FrameReader {
     class Size(val w: Int, val h: Int)
 
+    /** Why the last read failed — shown to the user so problems can be fixed. */
+    var lastError = ""
+
     /** Calls [onFrame] with ARGB pixels (already scaled) roughly every [stepUs]. Returns output size. */
     fun read(path: String, maxSide: Int, stepUs: Long, maxUs: Long, onFrame: (IntArray, Int, Int) -> Unit): Size? {
         var count = 0
         var got: Size? = null
+        lastError = ""
         try {
             viaCodec(path, maxSide, stepUs, maxUs) { p, w, h -> count++; got = Size(w, h); onFrame(p, w, h) }
-        } catch (e: Exception) { }
+            if (count == 0) lastError = "decoder: no frames"
+        } catch (e: Throwable) { lastError = "decoder: ${e.javaClass.simpleName} ${e.message}" }
         if (count > 0) return got
-        return viaRetriever(path, maxSide, stepUs, maxUs, onFrame)
+        return try {
+            viaRetriever(path, maxSide, stepUs, maxUs, onFrame).also { if (it == null) lastError += "; retriever: no frames" }
+        } catch (e: Throwable) { lastError += "; retriever: ${e.javaClass.simpleName} ${e.message}"; null }
     }
 
     private fun outSize(w: Int, h: Int, maxSide: Int): Pair<Int, Int> {
