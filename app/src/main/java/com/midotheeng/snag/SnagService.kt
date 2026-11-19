@@ -66,11 +66,16 @@ class SnagService : Service() {
         val (gifs, rest) = post.media.partition { it.kind == Kind.GIF }
         if (rest.isNotEmpty()) Saver.enqueue(this, post, rest)
         toast("Saving ${label(post.media)}")
+        var made = 0
         gifs.forEach { g ->
             goForeground("Making GIF…")
-            makeGif(post, g)
+            try { makeGif(post, g); made++ } catch (e: Exception) {
+                // Never come away empty-handed: keep the original looping MP4.
+                Saver.enqueue(this, post, listOf(g))
+                toast("Couldn't convert the GIF (${e.message}) — saved it as a video")
+            }
         }
-        if (gifs.isNotEmpty()) toast(if (gifs.size == 1) "GIF saved" else "${gifs.size} GIFs saved")
+        if (made > 0) toast(if (made == 1) "GIF saved" else "$made GIFs saved")
     }
 
     // ------------------------------------------------ GIF: download MP4 → real .gif
@@ -78,36 +83,14 @@ class SnagService : Service() {
         val tmp = File.createTempFile("snag", ".mp4", cacheDir)
         try {
             download(m.url, m.headers, tmp)
-            val r = MediaMetadataRetriever()
-            r.setDataSource(tmp.absolutePath)
-            val dur = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
-            val srcW = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
-            val srcH = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
-            val rot = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
-            val (vw, vh) = if (rot == 90 || rot == 270) srcH to srcW else srcW to srcH
-            if (dur <= 0 || vw <= 0) throw Exception("Couldn't read that GIF.")
-
+            if (tmp.length() < 1000) throw Exception("The GIF didn't download.")
             // Up to 480px on the long side (WhatsApp-friendly), ~14 fps, max 15 s.
-            val scale = minOf(1f, 480f / maxOf(vw, vh))
-            val w = maxOf(2, (vw * scale).toInt()); val h = maxOf(2, (vh * scale).toInt())
-            val stepMs = 70L
-            val total = minOf(dur, 15_000L)
-            val gif = GifMaker(w, h, (stepMs / 10).toInt())
-            val px = IntArray(w * h)
-            var t = 0L
-            while (t < total) {
-                val bmp = r.getScaledFrameAtTime(t * 1000, MediaMetadataRetriever.OPTION_CLOSEST, w, h)
-                if (bmp != null) {
-                    val b = if (bmp.width != w || bmp.height != h) Bitmap.createScaledBitmap(bmp, w, h, true) else bmp
-                    b.getPixels(px, 0, w, 0, 0, w, h)
-                    gif.addFrame(px)
-                    if (b !== bmp) b.recycle()
-                    bmp.recycle()
-                }
-                t += stepMs
+            var gif: GifMaker? = null
+            FrameReader.read(tmp.absolutePath, 480, 70_000L, 15_000_000L) { px, w, h ->
+                val g = gif ?: GifMaker(w, h, 7).also { gif = it }
+                g.addFrame(px)
             }
-            r.release()
-            if (gif.frameCount() == 0) throw Exception("Couldn't read that GIF.")
+            val g = gif?.takeIf { it.frameCount() > 0 } ?: throw Exception("Couldn't read that GIF.")
 
             val name = Saver.fileName(post, m, "gif")
             val values = ContentValues().apply {
@@ -118,7 +101,7 @@ class SnagService : Service() {
             }
             val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
                 ?: throw Exception("Couldn't save the GIF.")
-            contentResolver.openOutputStream(uri)!!.buffered().use { gif.write(it) }
+            contentResolver.openOutputStream(uri)!!.buffered().use { g.write(it) }
             values.clear(); values.put(MediaStore.MediaColumns.IS_PENDING, 0)
             contentResolver.update(uri, values, null, null)
         } finally { tmp.delete() }
