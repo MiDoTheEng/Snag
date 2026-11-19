@@ -49,7 +49,7 @@ class SnagService : Service() {
                     text != null -> handleLink(text)
                 }
             } catch (e: Exception) {
-                toast(e.message ?: "Snag couldn't save that.")
+                toastLong(e.message ?: "couldn't save that.")
             } finally {
                 if (jobs.decrementAndGet() == 0) withContext(Dispatchers.Main) {
                     stopForeground(STOP_FOREGROUND_REMOVE); stopSelf()
