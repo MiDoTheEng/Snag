@@ -44,7 +44,7 @@ private fun Home() {
             Spacer(Modifier.width(8.dp))
             Text("v" + ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName, color = Color(0xFF8B98A5), fontSize = 13.sp, modifier = Modifier.padding(bottom = 7.dp))
         }
-        Text("Full-resolution media from X, Pinterest, Facebook and Google", color = Color(0xFF536471), fontSize = 15.sp)
+        Text("Full-resolution media from X, Instagram, Pinterest, Facebook and Google", color = Color(0xFF536471), fontSize = 15.sp)
         Spacer(Modifier.height(24.dp))
 
         Column(Modifier.fillMaxWidth().background(Color(0xFFF7F9F9), RoundedCornerShape(18.dp)).padding(18.dp)) {

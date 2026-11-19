@@ -13,6 +13,7 @@ object Router {
         val url = Net.firstUrl(shared) ?: throw Exception("No link found in what was shared.")
         val host = Regex("""https?://([^/?#]+)""").find(url)?.groupValues?.get(1)?.lowercase().orEmpty()
         when {
+            host.endsWith("instagram.com") || host.endsWith("instagr.am") -> Instagram.fetch(url)
             host.endsWith("pin.it") || host.contains("pinterest.") -> Pinterest.fetch(url)
             host.endsWith("fb.watch") || host.endsWith("fb.com") || host.contains("facebook.com") -> Facebook.fetch(url)
             host.contains("google.") || host.endsWith("goo.gl") || host.endsWith("share.google") -> Google.fetch(url)
@@ -22,6 +23,97 @@ object Router {
                 XApi.extractId(page.url)?.let { XApi.fetch(it) } ?: Generic.fetch(url)
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------- Instagram
+object Instagram {
+    private val CODE = Regex("""instagr(?:am\.com|\.am)/(?:[^/?#]+/)?(?:p|reels?|tv)/([A-Za-z0-9_-]+)""")
+    private const val APP_ID = "936619743392459"
+
+    fun fetch(link: String): Post {
+        var code = CODE.find(link)?.groupValues?.get(1)
+        if (code == null) {                                   // share/short links → follow them
+            val p = Net.get(link, MOBILE_UA, readBody = false)
+            code = CODE.find(p.url)?.groupValues?.get(1)
+        }
+        if (code == null) throw Exception("Snag can save Instagram posts and reels (stories need a login).")
+
+        graphql(code)?.let { if (it.media.isNotEmpty()) return it }
+        embed(code)?.let { if (it.media.isNotEmpty()) return it }
+        openGraph(code)?.let { if (it.media.isNotEmpty()) return it }
+        throw NoMediaException("Instagram didn't share this post. It may be private.")
+    }
+
+    /** Instagram's own web API, as used by its website when you're logged out. */
+    private fun graphql(code: String): Post? {
+        val vars = """{"shortcode":"$code","child_comment_count":3,"fetch_comment_count":40,"parent_comment_count":24,"has_threaded_comments":true}"""
+        val url = "https://www.instagram.com/graphql/query/?doc_id=8845758582119845&variables=" + URLEncoder.encode(vars, "UTF-8")
+        val json = Net.json(url, mapOf(
+            "X-IG-App-ID" to APP_ID, "X-ASBD-ID" to "198387", "X-IG-WWW-Claim" to "0",
+            "X-Requested-With" to "XMLHttpRequest", "Origin" to "https://www.instagram.com",
+            "Referer" to "https://www.instagram.com/p/$code/",
+        ), DESKTOP_UA) ?: return null
+        val data = json.optJSONObject("data") ?: return null
+        val m = data.optJSONObject("xdt_shortcode_media") ?: data.optJSONObject("shortcode_media") ?: return null
+        return fromShortcodeMedia(code, m)
+    }
+
+    /** The public embed page carries the same data. */
+    private fun embed(code: String): Post? {
+        val html = Net.get("https://www.instagram.com/p/$code/embed/captioned/", DESKTOP_UA).body ?: return null
+        Regex(""""contextJSON"\s*:\s*"((?:[^"\\]|\\.)+)"""").find(html)?.let { m ->
+            try {
+                val ctx = JSONObject(Net.unescape(m.groupValues[1]))
+                val sm = ctx.optJSONObject("gql_data")?.optJSONObject("shortcode_media")
+                    ?: ctx.optJSONObject("context")?.optJSONObject("media")
+                if (sm != null) fromShortcodeMedia(code, sm).let { if (it.media.isNotEmpty()) return it }
+            } catch (_: Exception) {}
+        }
+        val media = mutableListOf<Media>()
+        Regex(""""video_url"\s*:\s*"((?:[^"\\]|\\.)+)"""").find(html)?.let {
+            media += Media(Kind.VIDEO, Net.unescape(it.groupValues[1]), "", "mp4")
+        }
+        (if (media.isEmpty())
+            Regex("""class="EmbeddedMediaImage"[^>]*src="([^"]+)"""").find(html)
+                ?: Regex("""<img[^>]+class="EmbeddedMediaImage"[^>]*srcset="([^" ]+)""").find(html)
+        else null)?.let { val u = it.groupValues[1].replace("&amp;", "&"); media += Media(Kind.PHOTO, u, u, "jpg") }
+        val user = Regex("""class="UsernameText"[^>]*>([^<]+)<""").find(html)?.groupValues?.get(1).orEmpty()
+        return Post("instagram", code, user, "", media)
+    }
+
+    /** Last resort: the preview tags Instagram shows to link-preview bots. */
+    private fun openGraph(code: String): Post? {
+        val html = try { Net.get("https://www.instagram.com/p/$code/", "facebookexternalhit/1.1").body } catch (e: Exception) { null } ?: return null
+        val video = Net.meta(html, "og:video:secure_url") ?: Net.meta(html, "og:video")
+        val image = Net.meta(html, "og:image")
+        val media = mutableListOf<Media>()
+        if (video != null) media += Media(Kind.VIDEO, video, image.orEmpty(), "mp4")
+        else if (image != null) media += Media(Kind.PHOTO, image, image, "jpg")
+        return Post("instagram", code, "", "", media)
+    }
+
+    private fun fromShortcodeMedia(code: String, m: JSONObject): Post {
+        val nodes = m.optJSONObject("edge_sidecar_to_children")?.optJSONArray("edges")
+            ?.let { e -> (0 until e.length()).mapNotNull { e.optJSONObject(it)?.optJSONObject("node") } }
+            ?.takeIf { it.isNotEmpty() } ?: listOf(m)
+        val media = nodes.mapNotNull { n ->
+            val thumb = n.optString("display_url")
+            val dims = n.optJSONObject("dimensions")
+            val w = dims?.optInt("width") ?: 0; val h = dims?.optInt("height") ?: 0
+            val video = n.optString("video_url")
+            if (n.optBoolean("is_video") && video.startsWith("http")) Media(Kind.VIDEO, video, thumb, "mp4", w, h)
+            else {
+                // Largest available photo (Instagram tops out at 1080 px wide for most posts)
+                val res = n.optJSONArray("display_resources")
+                val best = res?.let { r -> (0 until r.length()).mapNotNull { r.optJSONObject(it) }.maxByOrNull { it.optInt("config_width") } }
+                val url = best?.optString("src")?.takeIf { it.startsWith("http") } ?: thumb
+                if (url.startsWith("http")) Media(Kind.PHOTO, url, thumb.ifBlank { url }, "jpg",
+                    best?.optInt("config_width") ?: w, best?.optInt("config_height") ?: h) else null
+            }
+        }
+        val user = m.optJSONObject("owner")?.optString("username").orEmpty()
+        return Post("instagram", code, user, "", media)
     }
 }
 
