@@ -7,6 +7,8 @@ import android.media.MediaCodecInfo
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
+import java.io.FileInputStream
+import java.nio.ByteBuffer
 
 /**
  * Reads frames out of an MP4 for GIF making.
@@ -21,17 +23,59 @@ object FrameReader {
 
     /** Calls [onFrame] with ARGB pixels (already scaled) roughly every [stepUs]. Returns output size. */
     fun read(path: String, maxSide: Int, stepUs: Long, maxUs: Long, onFrame: (IntArray, Int, Int) -> Unit): Size? {
+        val errs = mutableListOf<String>()
         var count = 0
         var got: Size? = null
-        lastError = ""
+        val counted: (IntArray, Int, Int) -> Unit = { p, w, h -> count++; got = Size(w, h); onFrame(p, w, h) }
+
+        // 1) Our own MP4 reader → decoder (doesn't depend on Android's extractor)
         try {
-            viaCodec(path, maxSide, stepUs, maxUs) { p, w, h -> count++; got = Size(w, h); onFrame(p, w, h) }
-            if (count == 0) lastError = "decoder: no frames"
-        } catch (e: Throwable) { lastError = "decoder: ${e.javaClass.simpleName} ${e.message}" }
-        if (count > 0) return got
-        return try {
-            viaRetriever(path, maxSide, stepUs, maxUs, onFrame).also { if (it == null) lastError += "; retriever: no frames" }
-        } catch (e: Throwable) { lastError += "; retriever: ${e.javaClass.simpleName} ${e.message}"; null }
+            val d = Mp4Demux(path)
+            try {
+                val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, d.width, d.height)
+                fmt.setByteBuffer("csd-0", ByteBuffer.wrap(d.sps))
+                fmt.setByteBuffer("csd-1", ByteBuffer.wrap(d.pps))
+                fmt.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, (d.samples.maxOf { it[1] } + 4096).toInt())
+                var i = 0
+                decode(fmt, maxSide, stepUs, maxUs, counted) { buf ->
+                    if (i >= d.samples.size) null
+                    else {
+                        val data = d.frame(i); val pts = d.samples[i][2]; i++
+                        buf.clear(); buf.put(data); data.size to pts
+                    }
+                }
+            } finally { d.close() }
+            if (count > 0) return got
+            errs += "mp4: no frames"
+        } catch (e: Throwable) { errs += "mp4: ${e.javaClass.simpleName} ${e.message}" }
+
+        // 2) Android's extractor → decoder
+        try {
+            val ex = MediaExtractor()
+            FileInputStream(path).use { fis -> ex.setDataSource(fis.fd) }
+            try {
+                var track = -1
+                for (i in 0 until ex.trackCount) if (ex.getTrackFormat(i).getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true) { track = i; break }
+                if (track < 0) throw Exception("no video track")
+                ex.selectTrack(track)
+                decode(ex.getTrackFormat(track), maxSide, stepUs, maxUs, counted) { buf ->
+                    val n = ex.readSampleData(buf, 0)
+                    if (n < 0) null else (n to ex.sampleTime).also { ex.advance() }
+                }
+            } finally { ex.release() }
+            if (count > 0) return got
+            errs += "extractor: no frames"
+        } catch (e: Throwable) { errs += "extractor: ${e.javaClass.simpleName} ${e.message}" }
+
+        // 3) MediaMetadataRetriever
+        try {
+            val s = viaRetriever(path, maxSide, stepUs, maxUs, onFrame)
+            if (s != null) return s
+            errs += "retriever: no frames"
+        } catch (e: Throwable) { errs += "retriever: ${e.javaClass.simpleName} ${e.message}" }
+
+        lastError = errs.joinToString("; ")
+        return null
     }
 
     private fun outSize(w: Int, h: Int, maxSide: Int): Pair<Int, Int> {
@@ -39,73 +83,106 @@ object FrameReader {
         return maxOf(2, (w * scale).toInt()) to maxOf(2, (h * scale).toInt())
     }
 
-    private fun viaCodec(path: String, maxSide: Int, stepUs: Long, maxUs: Long, onFrame: (IntArray, Int, Int) -> Unit): Size? {
-        val ex = MediaExtractor()
-        ex.setDataSource(path)
-        var track = -1; var fmt: MediaFormat? = null
-        for (i in 0 until ex.trackCount) {
-            val f = ex.getTrackFormat(i)
-            if (f.getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true) { track = i; fmt = f; break }
-        }
-        if (track < 0 || fmt == null) { ex.release(); return null }
-        ex.selectTrack(track)
+    /** Runs a decoder; [feed] fills the input buffer and returns (size, ptsUs), or null at the end. */
+    private fun decode(
+        fmt: MediaFormat, maxSide: Int, stepUs: Long, maxUs: Long,
+        onFrame: (IntArray, Int, Int) -> Unit,
+        feed: (ByteBuffer) -> Pair<Int, Long>?,
+    ) {
         val mime = fmt.getString(MediaFormat.KEY_MIME)!!
         fmt.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
         val codec = MediaCodec.createDecoderByType(mime)
         codec.configure(fmt, null, null, 0)
         codec.start()
-
         val info = MediaCodec.BufferInfo()
         var inputDone = false
         var base = -1L
         var next = 0L
         var size: Size? = null
-        var px: IntArray? = null
+        var px = IntArray(0)
+        var idle = 0
         try {
             loop@ while (true) {
                 if (!inputDone) {
                     val ii = codec.dequeueInputBuffer(10_000)
                     if (ii >= 0) {
-                        val buf = codec.getInputBuffer(ii)!!
-                        val n = ex.readSampleData(buf, 0)
-                        if (n < 0) {
-                            codec.queueInputBuffer(ii, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM); inputDone = true
-                        } else {
-                            codec.queueInputBuffer(ii, 0, n, ex.sampleTime, 0); ex.advance()
-                        }
+                        val r = feed(codec.getInputBuffer(ii)!!)
+                        if (r == null) { codec.queueInputBuffer(ii, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM); inputDone = true }
+                        else codec.queueInputBuffer(ii, 0, r.first, r.second, 0)
                     }
                 }
                 val oi = codec.dequeueOutputBuffer(info, 10_000)
-                if (oi >= 0) {
-                    val eos = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
-                    if (info.size > 0) {
-                        if (base < 0) base = info.presentationTimeUs
-                        val t = info.presentationTimeUs - base
-                        if (t > maxUs) { codec.releaseOutputBuffer(oi, false); break@loop }
-                        if (t >= next) {
-                            val img = codec.getOutputImage(oi)
-                            if (img != null) {
-                                val crop = img.cropRect
-                                if (size == null) {
-                                    val (w, h) = outSize(crop.width(), crop.height(), maxSide)
-                                    size = Size(w, h); px = IntArray(w * h)
-                                }
-                                toArgb(img, size, px!!)
-                                img.close()
-                                onFrame(px, size.w, size.h)
-                            }
-                            while (next <= t) next += stepUs
+                if (oi < 0) { if (inputDone && ++idle > 300) break@loop; continue@loop }
+                idle = 0
+                val eos = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
+                if (info.size > 0) {
+                    if (base < 0) base = info.presentationTimeUs
+                    val t = info.presentationTimeUs - base
+                    if (t > maxUs) { codec.releaseOutputBuffer(oi, false); break@loop }
+                    if (t >= next) {
+                        val img = try { codec.getOutputImage(oi) } catch (e: Exception) { null }
+                        if (img != null) {
+                            val crop = img.cropRect
+                            val s = size ?: outSize(crop.width(), crop.height(), maxSide).let { (w, h) -> Size(w, h) }.also { size = it; px = IntArray(it.w * it.h) }
+                            toArgb(img, s, px)
+                            img.close()
+                            onFrame(px, s.w, s.h)
+                        } else {
+                            // Some decoders only hand out raw buffers
+                            val of = codec.outputFormat
+                            val bw = of.getInteger(MediaFormat.KEY_WIDTH); val bh = of.getInteger(MediaFormat.KEY_HEIGHT)
+                            val stride = if (of.containsKey(MediaFormat.KEY_STRIDE)) of.getInteger(MediaFormat.KEY_STRIDE) else bw
+                            val slice = if (of.containsKey(MediaFormat.KEY_SLICE_HEIGHT)) of.getInteger(MediaFormat.KEY_SLICE_HEIGHT) else bh
+                            val cf = of.getInteger(MediaFormat.KEY_COLOR_FORMAT)
+                            val vw = if (of.containsKey("crop-right")) of.getInteger("crop-right") - of.getInteger("crop-left") + 1 else bw
+                            val vh = if (of.containsKey("crop-bottom")) of.getInteger("crop-bottom") - of.getInteger("crop-top") + 1 else bh
+                            val s = size ?: outSize(vw, vh, maxSide).let { (w, h) -> Size(w, h) }.also { size = it; px = IntArray(it.w * it.h) }
+                            val buf = codec.getOutputBuffer(oi)!!
+                            rawToArgb(buf, info.offset, cf, stride, maxOf(slice, bh), vw, vh, s, px)
+                            onFrame(px, s.w, s.h)
                         }
+                        while (next <= t) next += stepUs
                     }
-                    codec.releaseOutputBuffer(oi, false)
-                    if (eos) break@loop
                 }
+                codec.releaseOutputBuffer(oi, false)
+                if (eos) break@loop
             }
         } finally {
             try { codec.stop() } catch (_: Exception) {}
-            codec.release(); ex.release()
+            codec.release()
         }
-        return size
+    }
+
+    /** Planar (I420) or semi-planar (NV12) buffers → ARGB. */
+    private fun rawToArgb(b: ByteBuffer, off: Int, cf: Int, stride: Int, slice: Int, vw: Int, vh: Int, s: Size, out: IntArray) {
+        val semi = cf != MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar
+        val uvStart = off + stride * slice
+        for (oy in 0 until s.h) {
+            val sy = oy * vh / s.h
+            for (ox in 0 until s.w) {
+                val sx = ox * vw / s.w
+                val y = (b.get(off + sy * stride + sx).toInt() and 255) - 16
+                val u: Int; val v: Int
+                if (semi) {
+                    val i = uvStart + (sy / 2) * stride + (sx / 2) * 2
+                    u = (b.get(i).toInt() and 255) - 128; v = (b.get(i + 1).toInt() and 255) - 128
+                } else {
+                    val cs = stride / 2
+                    val i = (sy / 2) * cs + sx / 2
+                    u = (b.get(uvStart + i).toInt() and 255) - 128
+                    v = (b.get(uvStart + cs * (slice / 2) + i).toInt() and 255) - 128
+                }
+                out[oy * s.w + ox] = yuv(y, u, v)
+            }
+        }
+    }
+
+    private fun yuv(y: Int, u: Int, v: Int): Int {
+        val yy = 1192 * maxOf(0, y)
+        val r = ((yy + 1634 * v) shr 10).coerceIn(0, 255)
+        val g = ((yy - 833 * v - 400 * u) shr 10).coerceIn(0, 255)
+        val bl = ((yy + 2066 * u) shr 10).coerceIn(0, 255)
+        return (0xFF shl 24) or (r shl 16) or (g shl 8) or bl
     }
 
     /** YUV_420_888 → ARGB with nearest-neighbour scaling to [s]. */
@@ -138,7 +215,7 @@ object FrameReader {
     private fun viaRetriever(path: String, maxSide: Int, stepUs: Long, maxUs: Long, onFrame: (IntArray, Int, Int) -> Unit): Size? {
         val r = MediaMetadataRetriever()
         try {
-            r.setDataSource(path)
+            FileInputStream(path).use { r.setDataSource(it.fd) }
             val first = r.getFrameAtTime(0) ?: r.getFrameAtIndex(0) ?: return null
             val (w, h) = outSize(first.width, first.height, maxSide)
             first.recycle()
