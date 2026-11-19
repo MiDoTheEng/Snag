@@ -1,55 +1,34 @@
 package com.midotheeng.snag
 
+import android.app.Activity
 import android.content.Intent
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
-import androidx.activity.ComponentActivity
-import androidx.activity.compose.setContent
-import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
-import androidx.compose.runtime.remember
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.unit.dp
+import android.widget.Toast
 
-/** Target of "Share → Snag" from the X app or a browser. Shows a small card and closes itself. */
-class ShareActivity : ComponentActivity() {
+/**
+ * Invisible: receives "Share → Snag", passes it to the background service and
+ * closes instantly, so you go straight back to what you were doing.
+ */
+class ShareActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val text = intent?.takeIf { it.action == Intent.ACTION_SEND }?.getStringExtra(Intent.EXTRA_TEXT)
-            ?: intent?.dataString
-        val id = XApi.extractId(text)
-
-        setContent {
-            MaterialTheme {
-                Box(
-                    Modifier.fillMaxSize()
-                        .background(Color(0x66000000))
-                        .clickable(remember { MutableInteractionSource() }, null) { finish() },
-                    contentAlignment = Alignment.BottomCenter
-                ) {
-                    Box(
-                        Modifier.fillMaxWidth()
-                            .padding(10.dp)
-                            .navigationBarsPadding()
-                            .background(Color.White, RoundedCornerShape(24.dp))
-                            .clickable(remember { MutableInteractionSource() }, null) { /* keep open */ }
-                    ) {
-                        if (id == null) {
-                            Column(Modifier.padding(20.dp)) {
-                                Text("That doesn't look like an X post link.", color = Ink)
-                            }
-                        } else {
-                            SnagPanel(id, onAllDone = { finish() })
-                        }
-                    }
-                }
+        val i = intent
+        val stream: Uri? = if (Build.VERSION.SDK_INT >= 33)
+            i?.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+        else @Suppress("DEPRECATION") i?.getParcelableExtra(Intent.EXTRA_STREAM)
+        val text = i?.getStringExtra(Intent.EXTRA_TEXT) ?: i?.dataString
+        try {
+            when {
+                text != null && Net.firstUrl(text) != null -> SnagService.startLink(this, text)
+                stream != null -> SnagService.startFile(this, stream, i?.type)
+                text != null && XApi.extractId(text) != null -> SnagService.startLink(this, text)
+                else -> Toast.makeText(this, "Snag: no link found", Toast.LENGTH_SHORT).show()
             }
+        } catch (e: Exception) {
+            Toast.makeText(this, "Snag: ${e.message}", Toast.LENGTH_SHORT).show()
         }
+        finish()
     }
 }

@@ -4,8 +4,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
-import java.net.HttpURLConnection
-import java.net.URL
 
 enum class Kind { PHOTO, VIDEO, GIF }
 
@@ -16,11 +14,13 @@ data class Media(
     val ext: String,        // jpg / png / mp4 ...
     val width: Int = 0,
     val height: Int = 0,
+    val headers: Map<String, String> = emptyMap(),
 )
 
-data class Tweet(val id: String, val user: String, val text: String, val media: List<Media>)
+/** One shared post/page and everything downloadable in it. */
+data class Post(val source: String, val id: String, val user: String, val text: String, val media: List<Media>)
 
-class NoMediaException(msg: String) : Exception(msg)
+class NoMediaException(msg: String = "No photos or videos found here.") : Exception(msg)
 
 object XApi {
 
@@ -34,7 +34,7 @@ object XApi {
         return BARE_ID.find(text)?.groupValues?.get(1)
     }
 
-    suspend fun fetch(id: String): Tweet = withContext(Dispatchers.IO) {
+    suspend fun fetch(id: String): Post = withContext(Dispatchers.IO) {
         val errors = mutableListOf<String>()
         for (source in listOf(::fromSyndication, ::fromFx, ::fromVx)) {
             try {
@@ -51,8 +51,8 @@ object XApi {
     }
 
     // ---------- 1) X's own embed API (no login) ----------
-    private fun fromSyndication(id: String): Tweet? {
-        val json = getJson("https://cdn.syndication.twimg.com/tweet-result?id=$id&lang=en&token=${token(id)}") ?: return null
+    private fun fromSyndication(id: String): Post? {
+        val json = Net.json("https://cdn.syndication.twimg.com/tweet-result?id=$id&lang=en&token=${token(id)}") ?: return null
         if (json.optString("__typename") == "TweetTombstone") return null
         var details = json.optJSONArray("mediaDetails")
         if (details == null || details.length() == 0) {
@@ -73,12 +73,12 @@ object XApi {
             }
         }
         val user = json.optJSONObject("user")?.optString("screen_name").orEmpty()
-        return Tweet(id, user, json.optString("text"), media)
+        return Post("x", id, user, json.optString("text"), media)
     }
 
     // ---------- 2) FxTwitter ----------
-    private fun fromFx(id: String): Tweet? {
-        val tw = getJson("https://api.fxtwitter.com/status/$id")?.optJSONObject("tweet") ?: return null
+    private fun fromFx(id: String): Post? {
+        val tw = Net.json("https://api.fxtwitter.com/status/$id")?.optJSONObject("tweet") ?: return null
         var all = tw.optJSONObject("media")?.optJSONArray("all")
         if (all == null || all.length() == 0) all = tw.optJSONObject("quote")?.optJSONObject("media")?.optJSONArray("all")
         val media = mutableListOf<Media>()
@@ -94,12 +94,12 @@ object XApi {
                 }
             }
         }
-        return Tweet(id, tw.optJSONObject("author")?.optString("screen_name").orEmpty(), tw.optString("text"), media)
+        return Post("x", id, tw.optJSONObject("author")?.optString("screen_name").orEmpty(), tw.optString("text"), media)
     }
 
     // ---------- 3) vxTwitter ----------
-    private fun fromVx(id: String): Tweet? {
-        val json = getJson("https://api.vxtwitter.com/Twitter/status/$id") ?: return null
+    private fun fromVx(id: String): Post? {
+        val json = Net.json("https://api.vxtwitter.com/Twitter/status/$id") ?: return null
         val arr = json.optJSONArray("media_extended")
         val media = mutableListOf<Media>()
         if (arr != null) for (i in 0 until arr.length()) {
@@ -114,7 +114,7 @@ object XApi {
                 )
             }
         }
-        return Tweet(id, json.optString("user_screen_name"), json.optString("text"), media)
+        return Post("x", id, json.optString("user_screen_name"), json.optString("text"), media)
     }
 
     /** Turn any pbs.twimg.com photo link into its original-size version. */
@@ -144,18 +144,6 @@ object XApi {
         return best
     }
 
-    private fun getJson(url: String): JSONObject? {
-        val c = URL(url).openConnection() as HttpURLConnection
-        c.connectTimeout = 12000; c.readTimeout = 15000
-        c.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36")
-        c.setRequestProperty("Accept", "application/json")
-        try {
-            if (c.responseCode !in 200..299) return null
-            val body = c.inputStream.bufferedReader().use { it.readText() }
-            if (body.isBlank()) return null
-            return JSONObject(body)
-        } finally { c.disconnect() }
-    }
 
     // The embed API wants a token derived from the id: ((id / 1e15) * PI).toString(36) with 0s and dots removed.
     fun token(id: String): String =
