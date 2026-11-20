@@ -58,6 +58,30 @@ private fun Home() {
             )
         }
 
+        Spacer(Modifier.height(14.dp))
+        var igIn by remember { mutableStateOf(Instagram.signedIn()) }
+        androidx.lifecycle.compose.LifecycleResumeEffect(Unit) {
+            igIn = Instagram.signedIn()
+            onPauseOrDispose { }
+        }
+        Row(
+            Modifier.fillMaxWidth().background(Color(0xFFF7F9F9), RoundedCornerShape(18.dp)).padding(horizontal = 18.dp, vertical = 12.dp),
+            verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("Instagram", fontWeight = FontWeight.Bold, color = Ink)
+                Text(
+                    if (igIn) "Signed in ✓ — posts, reels and stories" else "Sign in so Instagram posts and stories work",
+                    color = Color(0xFF536471), fontSize = 13.sp
+                )
+            }
+            if (igIn) TextButton(onClick = { InstagramLogin.signOut(); igIn = false }) { Text("Sign out") }
+            else Button(
+                onClick = { ctx.startActivity(android.content.Intent(ctx, InstagramLogin::class.java)) },
+                colors = ButtonDefaults.buttonColors(containerColor = Ink)
+            ) { Text("Sign in") }
+        }
+
         Spacer(Modifier.height(24.dp))
         OutlinedTextField(
             value = link, onValueChange = { link = it },

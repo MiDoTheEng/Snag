@@ -44,6 +44,12 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".InstagramLogin"
+            android:exported="false"
+            android:label="Sign in to Instagram"
+            android:theme="@android:style/Theme.Material.Light" />
+
         <service
             android:name=".SnagService"
             android:exported="false"

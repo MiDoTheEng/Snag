@@ -13,7 +13,10 @@ object Router {
         val url = Net.firstUrl(shared) ?: throw Exception("No link found in what was shared.")
         val host = Regex("""https?://([^/?#]+)""").find(url)?.groupValues?.get(1)?.lowercase().orEmpty()
         when {
-            host.endsWith("instagram.com") || host.endsWith("instagr.am") -> Instagram.fetch(url)
+            host.endsWith("instagram.com") || host.endsWith("instagr.am") -> {
+                val cookie = withContext(Dispatchers.Main) { Instagram.webCookies() }
+                Instagram.fetch(url, cookie)
+            }
             host.endsWith("pin.it") || host.contains("pinterest.") -> Pinterest.fetch(url)
             host.endsWith("fb.watch") || host.endsWith("fb.com") || host.contains("facebook.com") -> Facebook.fetch(url)
             host.contains("google.") || host.endsWith("goo.gl") || host.endsWith("share.google") -> Google.fetch(url)

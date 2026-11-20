@@ -15,39 +15,86 @@ import java.net.URLEncoder
  */
 object Instagram {
     private val CODE = Regex("""instagr(?:am\.com|\.am)/(?:[^/?#]+/)?(p|reels?|tv)/([A-Za-z0-9_-]+)""")
+    private val STORY = Regex("""instagram\.com/stories/[^/?#]+/(\d+)""")
     private const val APP_ID = "936619743392459"
     private const val DOC_ID = "8845758582119845"
+    private const val ALPHA = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 
-    fun fetch(link: String): Post {
-        var m = CODE.find(link)
-        if (m == null) m = CODE.find(Net.get(link, MOBILE_UA, readBody = false).url)
-        if (m == null) throw Exception("Snag can save Instagram posts and reels (stories need a login).")
+    /** Cookies from Snag's built-in Instagram sign-in (call on the main thread). */
+    fun webCookies(): String? = try {
+        android.webkit.CookieManager.getInstance().getCookie("https://www.instagram.com")
+    } catch (e: Exception) { null }
+
+    fun signedIn(): Boolean = webCookies()?.contains("sessionid=") == true
+
+    fun fetch(link: String, cookieHeader: String?): Post {
+        val jar = parseCookies(cookieHeader)
+        val loggedIn = jar.containsKey("sessionid")
+        val errors = mutableListOf<String>()
+
+        // Stories: the media id is in the link
+        val resolved = if (CODE.containsMatchIn(link) || STORY.containsMatchIn(link)) link
+            else try { Net.get(link, MOBILE_UA, readBody = false).url } catch (e: Exception) { link }
+        STORY.find(resolved)?.let { st ->
+            if (!loggedIn) throw Exception("Stories need you signed in: open Snag → Sign in to Instagram.")
+            return api(st.groupValues[1], st.groupValues[1], jar) ?: throw Exception("Instagram didn't return this story.")
+        }
+        val m = CODE.find(resolved) ?: throw Exception("Snag can save Instagram posts, reels and stories.")
         val kind = m.groupValues[1]; val code = m.groupValues[2]
         val wantVideo = kind != "p"
 
-        val errors = mutableListOf<String>()
         var photosOnly: Post? = null
-        val tries: List<Pair<String, () -> Post?>> = listOf(
-            "web" to { webPost(code, kind) },
-            "api" to { webGet(code) },
-            "embed" to { embed(code) },
-        )
+        val tries = mutableListOf<Pair<String, () -> Post?>>()
+        if (loggedIn) tries += "signed-in" to { api(mediaId(code), code, jar) }
+        tries += "web" to { webPost(code, kind, jar.toMutableMap()) }
+        tries += "api" to { webGet(code) }
+        tries += "embed" to { embed(code) }
         for ((name, attempt) in tries) {
             val p = try { attempt() } catch (e: Exception) { errors += "$name: ${e.message}"; null }
-            if (p == null || p.media.isEmpty()) { errors += "$name: nothing"; continue }
+            if (p == null || p.media.isEmpty()) { if (errors.none { it.startsWith("$name:") }) errors += "$name: refused"; continue }
             val hasVideo = p.media.any { it.kind == Kind.VIDEO }
             if (hasVideo || !wantVideo) return p
             if (photosOnly == null) photosOnly = p
             errors += "$name: only the cover image"
         }
-        if (wantVideo) throw Exception("Instagram didn't give the video (${errors.joinToString("; ")})")
-        return photosOnly ?: throw NoMediaException("Instagram didn't share this post. It may be private.")
+        val hint = if (loggedIn) "" else " Sign in to Instagram in Snag to fix this."
+        if (wantVideo || photosOnly == null)
+            throw Exception("Instagram blocked it.$hint (${errors.joinToString("; ")})")
+        return photosOnly
     }
 
+    // ------------------------------------------------------------------ 0) Signed in: the same API the website uses
+    private fun api(id: String, code: String, jar: Map<String, String>): Post? {
+        val body = request(
+            "https://www.instagram.com/api/v1/media/$id/info/",
+            cookies = jar.toMutableMap(),
+            headers = mapOf(
+                "X-IG-App-ID" to APP_ID, "X-CSRFToken" to (jar["csrftoken"] ?: ""),
+                "X-ASBD-ID" to "129477", "X-Requested-With" to "XMLHttpRequest", "X-IG-WWW-Claim" to "0",
+                "Referer" to "https://www.instagram.com/", "Origin" to "https://www.instagram.com", "Accept" to "*/*",
+            ),
+        ) ?: throw Exception("not allowed (sign in again?)")
+        val item = JSONObject(body).optJSONArray("items")?.optJSONObject(0) ?: return null
+        return fromItem(code, item)
+    }
+
+    /** Instagram shortcode → numeric media id. */
+    private fun mediaId(code: String): String {
+        var id = java.math.BigInteger.ZERO
+        val sixtyFour = java.math.BigInteger.valueOf(64)
+        for (c in code.take(11)) id = id.multiply(sixtyFour).add(java.math.BigInteger.valueOf(ALPHA.indexOf(c).toLong()))
+        return id.toString()
+    }
+
+    private fun parseCookies(h: String?): Map<String, String> =
+        h.orEmpty().split(';').mapNotNull { p ->
+            val k = p.substringBefore('=').trim(); val v = p.substringAfter('=', "").trim()
+            if (k.isEmpty() || v.isEmpty()) null else k to v
+        }.toMap()
+
     // ------------------------------------------------------------------ 1) POST, like instagram.com does
-    private fun webPost(code: String, kind: String): Post? {
+    private fun webPost(code: String, kind: String, cookies: MutableMap<String, String>): Post? {
         // Visit the page first to get the session cookies and the LSD token.
-        val cookies = mutableMapOf<String, String>()
         val pagePath = if (kind == "p") "p" else "reel"
         val html = request("https://www.instagram.com/$pagePath/$code/", cookies = cookies) ?: ""
         val lsd = Regex(""""LSD",\[],\{"token":"([^"]+)"""").find(html)?.groupValues?.get(1)
